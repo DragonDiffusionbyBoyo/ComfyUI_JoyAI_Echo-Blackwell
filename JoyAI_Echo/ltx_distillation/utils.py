@@ -7,10 +7,77 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
+import av
+import numpy as np
 import torch
 import torchaudio
-from torchvision.io import write_video
 from torchvision.transforms import functional as TVF
+
+
+def write_video(
+    filename: str,
+    video_array: torch.Tensor,
+    fps: float,
+    audio_array: torch.Tensor | None = None,
+    audio_fps: int | None = None,
+    audio_codec: str = "aac",
+    video_codec: str = "libx264",
+) -> None:
+    """Drop-in replacement for torchvision.io.write_video using PyAV.
+
+    Args:
+        filename: Output file path.
+        video_array: uint8 tensor of shape (T, H, W, 3).
+        fps: Video frame rate.
+        audio_array: Optional float32 tensor of shape (C, T) or (T,).
+        audio_fps: Audio sample rate (required if audio_array is provided).
+        audio_codec: Audio codec string (default 'aac').
+        video_codec: Video codec string (default 'libx264').
+    """
+    T, H, W, C = video_array.shape
+    assert C == 3, f"Expected RGB video, got {C} channels"
+
+    with av.open(filename, mode="w") as container:
+        v_stream = container.add_stream(video_codec, rate=fps)
+        v_stream.width = W
+        v_stream.height = H
+        v_stream.pix_fmt = "yuv420p"
+        v_stream.options = {"crf": "18", "preset": "medium"}
+
+        a_stream = None
+        if audio_array is not None and audio_fps is not None:
+            a_stream = container.add_stream(audio_codec, rate=audio_fps)
+            a_stream.layout = "stereo" if (audio_array.ndim == 2 and audio_array.shape[0] == 2) else "mono"
+
+        # Write video frames
+        frames_np = video_array.cpu().numpy()  # (T, H, W, 3) uint8
+        for i in range(T):
+            frame = av.VideoFrame.from_ndarray(frames_np[i], format="rgb24")
+            frame.pts = i
+            frame.time_base = v_stream.codec_context.time_base
+            for packet in v_stream.encode(frame):
+                container.mux(packet)
+        for packet in v_stream.encode():
+            container.mux(packet)
+
+        # Write audio
+        if a_stream is not None and audio_array is not None:
+            audio_np = audio_array.cpu().float().numpy()
+            if audio_np.ndim == 1:
+                audio_np = audio_np[np.newaxis, :]  # (1, T)
+            # av expects (C, T) float32 for fltp format
+            a_stream.codec_context.format = av.AudioFormat("fltp")
+            chunk_size = 1024
+            n_samples = audio_np.shape[1]
+            for start in range(0, n_samples, chunk_size):
+                chunk = audio_np[:, start:start + chunk_size]
+                a_frame = av.AudioFrame.from_ndarray(chunk, format="fltp", layout=a_stream.layout.name)
+                a_frame.sample_rate = audio_fps
+                a_frame.pts = start
+                for packet in a_stream.encode(a_frame):
+                    container.mux(packet)
+            for packet in a_stream.encode():
+                container.mux(packet)
 from ..ltx_core.model.video_vae import TilingConfig,SpatialTilingConfig,TemporalTilingConfig
 from .inference.memory_multishot import (
     audio_waveform_stats,
