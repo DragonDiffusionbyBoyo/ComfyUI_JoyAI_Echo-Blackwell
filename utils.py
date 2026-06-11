@@ -1,313 +1,304 @@
-"""Shared utilities for inference: latent computation, noise, media I/O, video concat."""
+from diffusers.quantizers.gguf.utils import dequantize_gguf_tensor
 
-from __future__ import annotations
-
-import subprocess
-import tempfile
-from pathlib import Path
-from typing import Any, Optional
-
-import av
-import numpy as np
+from contextlib import contextmanager
+from .layer_streaming import SimpleLayerStreamingWrapper,LayerStreamingWrapper,SimpleLayerTEWrapper
+from collections.abc import Iterator
+from typing import TypeVar
+import gc
 import torch
-import torchaudio
-from torchvision.transforms import functional as TVF
+# from utils import apply_loras_gguf
+
+_M = TypeVar("_M", bound=torch.nn.Module)
+T = TypeVar("T")
 
 
-def write_video(
-    filename: str,
-    video_array: torch.Tensor,
-    fps: float,
-    audio_array: torch.Tensor | None = None,
-    audio_fps: int | None = None,
-    audio_codec: str = "aac",
-    video_codec: str = "libx264",
-) -> None:
-    """Drop-in replacement for torchvision.io.write_video using PyAV.
-
-    Args:
-        filename: Output file path.
-        video_array: uint8 tensor of shape (T, H, W, 3).
-        fps: Video frame rate.
-        audio_array: Optional float32 tensor of shape (C, T) or (T,).
-        audio_fps: Audio sample rate (required if audio_array is provided).
-        audio_codec: Audio codec string (default 'aac').
-        video_codec: Video codec string (default 'libx264').
-    """
-    T, H, W, C = video_array.shape
-    assert C == 3, f"Expected RGB video, got {C} channels"
-
-    with av.open(filename, mode="w") as container:
-        v_stream = container.add_stream(video_codec, rate=fps)
-        v_stream.width = W
-        v_stream.height = H
-        v_stream.pix_fmt = "yuv420p"
-        v_stream.options = {"crf": "18", "preset": "medium"}
-
-        a_stream = None
-        if audio_array is not None and audio_fps is not None:
-            a_stream = container.add_stream(audio_codec, rate=audio_fps)
-            a_stream.layout = "stereo" if (audio_array.ndim == 2 and audio_array.shape[0] == 2) else "mono"
-
-        # Write video frames
-        frames_np = video_array.cpu().numpy()  # (T, H, W, 3) uint8
-        for i in range(T):
-            frame = av.VideoFrame.from_ndarray(frames_np[i], format="rgb24")
-            frame.pts = i
-            frame.time_base = v_stream.codec_context.time_base
-            for packet in v_stream.encode(frame):
-                container.mux(packet)
-        for packet in v_stream.encode():
-            container.mux(packet)
-
-        # Write audio
-        if a_stream is not None and audio_array is not None:
-            audio_np = audio_array.cpu().float().numpy()
-            if audio_np.ndim == 1:
-                audio_np = audio_np[np.newaxis, :]  # (1, T)
-            # av expects (C, T) float32 for fltp format
-            a_stream.codec_context.format = av.AudioFormat("fltp")
-            chunk_size = 1024
-            n_samples = audio_np.shape[1]
-            for start in range(0, n_samples, chunk_size):
-                chunk = audio_np[:, start:start + chunk_size]
-                a_frame = av.AudioFrame.from_ndarray(chunk, format="fltp", layout=a_stream.layout.name)
-                a_frame.sample_rate = audio_fps
-                a_frame.pts = start
-                for packet in a_stream.encode(a_frame):
-                    container.mux(packet)
-            for packet in a_stream.encode():
-                container.mux(packet)
-from ..ltx_core.model.video_vae import TilingConfig,SpatialTilingConfig,TemporalTilingConfig
-from .inference.memory_multishot import (
-    audio_waveform_stats,
-    normalize_audio_waveform_for_media,
-)
+@contextmanager
+def _full_gpu_ctx(model,device=None):
+    """Context manager to load the entire model to GPU and release it after use."""
+    try:
+        if device is not None:
+            device = torch.device(device)
+            model.to(device)
+        yield model
+    finally:
+        model.to("cpu")
 
 
-def compute_latent_shapes(
-    *,
-    num_frames: int,
-    video_height: int,
-    video_width: int,
-    batch_size: int = 1,
-    latent_channels: int = 128,
-    vae_temporal_compression: int = 8,
-    vae_spatial_compression: int = 32,
-    video_fps: float = 24.0,
-    audio_sample_rate: int = 16000,
-    audio_hop_length: int = 160,
-    audio_latent_downsample: int = 4,
-) -> tuple[list[int], list[int]]:
-    if (num_frames - 1) % vae_temporal_compression != 0:
-        raise ValueError(f"num_frames must be 1 + 8*k, got {num_frames}")
+def cleanup_memory() -> None:
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
 
-    latent_frames = 1 + (num_frames - 1) // vae_temporal_compression
-    latent_h = video_height // vae_spatial_compression
-    latent_w = video_width // vae_spatial_compression
+# LayerStreamingWrapper from https://github.com/Lightricks/LTX-2
 
-    video_duration = float(num_frames) / float(video_fps)
-    audio_latent_fps = float(audio_sample_rate) / float(audio_hop_length) / float(audio_latent_downsample)
-    audio_frames = round(video_duration * audio_latent_fps)
+@contextmanager
+def streaming_single_model(
+    model: _M,
+    layers_attr: str,
+    target_device: torch.device,
+) -> Iterator[_M]:
+    """Wrap *model* with :class:`LayerStreamingWrapper`, yield it, then tear down."""
+    wrapped = SimpleLayerStreamingWrapper(
+        model,
+        layers_attr=layers_attr,
+        target_device=target_device,
+    )
+    try:
+        yield wrapped  # type: ignore[misc]
+    finally:
+        wrapped.to("cpu")
+        cleanup_memory()
+        # Flush the host (pinned) memory cache so that freed pinned pages are
+        # returned to the OS.  Without this, sequential streaming models
+        # (e.g. text encoder then transformer) exhaust host memory because the
+        # CachingHostAllocator keeps freed blocks cached indefinitely.
+        torch.cuda.synchronize(device=target_device)
+        try:
+            if hasattr(torch._C, "_host_emptyCache"):
+                torch._C._host_emptyCache()
+        except Exception:
+            print("Host empty cache cleanup failed; ignoring.", exc_info=True)
 
-    return (
-        [batch_size, latent_frames, latent_channels, latent_h, latent_w],
-        [batch_size, audio_frames, latent_channels],
+@contextmanager
+def streaming_single_te(
+    model: _M,  # 模型参数，类型为_M
+    layers_attr: str,  # 属性字符串，用于指定模型中的层
+    target_device: torch.device,  # 目标设备，用于指定模型运行在哪个设备上
+) -> Iterator[_M]:
+    """Wrap *model* with :class:`LayerStreamingWrapper`, yield it, then tear down."""
+    wrapped = SimpleLayerTEWrapper(
+        model,
+        layers_attr=layers_attr,
+        target_device=target_device,
+    )
+    try:
+        yield wrapped  # type: ignore[misc]
+    finally:
+        wrapped.to("cpu")
+        cleanup_memory()
+        # Flush the host (pinned) memory cache so that freed pinned pages are
+        # returned to the OS.  Without this, sequential streaming models
+        # (e.g. text encoder then transformer) exhaust host memory because the
+        # CachingHostAllocator keeps freed blocks cached indefinitely.
+        torch.cuda.synchronize(device=target_device)
+        try:
+            if hasattr(torch._C, "_host_emptyCache"):
+                torch._C._host_emptyCache()
+        except Exception:
+            print("Host empty cache cleanup failed; ignoring.", exc_info=True)
+
+
+@contextmanager
+def streaming_prefetch_model(
+    model: _M,
+    layers_attr: str,
+    target_device: torch.device,
+    prefetch_count: int,
+) -> Iterator[_M]:
+    """Wrap *model* with :class:`LayerStreamingWrapper`, yield it, then tear down."""
+    wrapped = LayerStreamingWrapper(
+        model,
+        layers_attr=layers_attr,
+        target_device=target_device,
+        prefetch_count=prefetch_count,
+    )
+    try:
+        yield wrapped  # type: ignore[misc]
+    finally:
+        # if hasattr(wrapped, 'teardown'):
+        #     wrapped.teardown()
+        wrapped.to("cpu")
+        cleanup_memory()
+        # Flush the host (pinned) memory cache so that freed pinned pages are
+        # returned to the OS.  Without this, sequential streaming models
+        # (e.g. text encoder then transformer) exhaust host memory because the
+        # CachingHostAllocator keeps freed blocks cached indefinitely.
+        torch.cuda.synchronize(device=target_device)
+        try:
+            if hasattr(torch._C, "_host_emptyCache"):
+                torch._C._host_emptyCache()
+        except Exception:
+            print("Host empty cache cleanup failed; ignoring.", exc_info=True)
+
+def set_gguf2meta_model(meta_model,model_state_dict,dtype,device,lora_sd=None):
+    from diffusers import GGUFQuantizationConfig
+    from diffusers.quantizers.gguf import GGUFQuantizer
+
+    g_config = GGUFQuantizationConfig(compute_dtype=dtype or torch.bfloat16)
+    hf_quantizer = GGUFQuantizer(quantization_config=g_config)
+    hf_quantizer.pre_quantized = True
+    if lora_sd is not None:
+        try:
+            model_state_dict=apply_loras_gguf(model_state_dict, lora_sd)
+            print("Applying LoRAs to GGUF model success>")
+        except Exception as e:
+            print(f"Error applying LoRAs to GGUF model: {e}")
+            pass
+
+    hf_quantizer._process_model_before_weight_loading(
+        meta_model,
+        device_map={"": device} if device else None,
+        state_dict=model_state_dict
+    )
+    from diffusers.models.model_loading_utils import load_model_dict_into_meta
+    load_model_dict_into_meta(
+        meta_model, 
+        model_state_dict, 
+        hf_quantizer=hf_quantizer,
+        device_map={"": device} if device else None,
+        dtype=dtype
     )
 
+    hf_quantizer._process_model_after_weight_loading(meta_model)
+    
+    del model_state_dict
+    gc.collect()
+    
+    return meta_model.to(dtype=dtype)
 
-def add_noise(original: torch.Tensor, noise: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-    sigma = sigma.to(device=original.device, dtype=original.dtype)
-    if sigma.dim() == 1:
-        sigma = sigma.reshape(-1, *[1] * (original.dim() - 1))
-    elif sigma.dim() == 2:
-        sigma = sigma.reshape(*sigma.shape, *[1] * (original.dim() - 2))
-    return (1 - sigma) * original + sigma * noise
+def load_gguf_checkpoint_gemma(gguf_checkpoint_path):
 
+    from  diffusers.utils  import is_gguf_available, is_torch_available
+    if is_gguf_available() and is_torch_available():
+        import gguf
+        from gguf import GGUFReader
+        from diffusers.quantizers.gguf.utils import SUPPORTED_GGUF_QUANT_TYPES, GGUFParameter,dequantize_gguf_tensor
+    else:
+        raise ImportError("Please install torch and gguf>=0.10.0 to load a GGUF checkpoint in PyTorch.")
 
-def frames_to_video_tensor(frames, target_h: int, target_w: int) -> torch.Tensor:
-    tensors = []
-    for idx, image in enumerate(frames):
-        if image.size != (target_w, target_h):
+    reader = GGUFReader(gguf_checkpoint_path)
+    parsed_parameters = {}
+ 
+    for tensor in reader.tensors:
+        name = tensor.name
+        quant_type = tensor.tensor_type
+
+        # if the tensor is a torch supported dtype do not use GGUFParameter
+        is_gguf_quant = quant_type not in [gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16]
+        if is_gguf_quant and quant_type not in SUPPORTED_GGUF_QUANT_TYPES:
+            _supported_quants_str = "\n".join([str(type) for type in SUPPORTED_GGUF_QUANT_TYPES])
             raise ValueError(
-                f"Frame size mismatch at index {idx}: got={image.size}, expected={(target_w, target_h)}"
+                (
+                    f"{name} has a quantization type: {str(quant_type)} which is unsupported."
+                    "\n\nCurrently the following quantization types are supported: \n\n"
+                    f"{_supported_quants_str}"
+                    "\n\nTo request support for this quantization type please open an issue here: https://github.com/huggingface/diffusers"
+                )
             )
-        tensor = TVF.to_tensor(image)
-        tensors.append(tensor * 2.0 - 1.0)
-    return torch.stack(tensors, dim=1).contiguous()
+
+        weights = torch.from_numpy(tensor.data.copy())
+        parsed_parameters[name] = GGUFParameter(weights, quant_type=quant_type) if is_gguf_quant else weights
+    
+    del reader
+    gc.collect()
+    return parsed_parameters
 
 
-@torch.no_grad()
-def encode_memory_frames_batch(
-    *,
-    video_vae,
-    batch_memory_frames,
-    target_h: int,
-    target_w: int,
-    device: torch.device,
-    dtype: torch.dtype,
+def match_state_dict(meta_model, sd,show_num=10):
+
+    meta_model_keys = set(meta_model.state_dict().keys())   
+    state_dict_keys = set(sd.keys())
+
+    matching_keys = meta_model_keys.intersection(state_dict_keys)
+    print(f"Matching keys count: {len(matching_keys)}")
     
 
-) -> torch.Tensor:
-    if getattr(video_vae, "encoder", None) is None:
-        raise RuntimeError("video VAE encoder is not initialized for memory encoding")
+    extra_keys = state_dict_keys - meta_model_keys
+    if extra_keys:
+        print(f"Extra keys in state_dict (not in meta_model): {len(extra_keys)}")
+        for key in list(extra_keys)[:show_num]: 
+            print(f"  - {key}")
+    
+    missing_keys = meta_model_keys - state_dict_keys
+    if missing_keys:
+        print(f"Missing keys in state_dict (not in state_dict): {len(missing_keys)}")
+        for key in list(missing_keys)[:show_num]:  
+            print(f"  - {key}")
+    
+    print(f"Sample matching keys: {list(matching_keys)[:5]}")
 
-    latents = []
-    for memory_frames in batch_memory_frames:
-        if not memory_frames:
-            raise ValueError("memory_frames cannot be empty when encoding memory video")
-        per_frame_latents = []
-        for memory_item in memory_frames:
-            is_clip_memory = isinstance(memory_item, list)
-            frame_video = frames_to_video_tensor(
-                memory_item if is_clip_memory else [memory_item],
-                target_h,
-                target_w,
-            ).unsqueeze(0).to(device=device, dtype=dtype)
-            latent = video_vae.encode(frame_video)
-            del frame_video
-            latent = latent.permute(0, 2, 1, 3, 4).to(dtype=dtype)
-            if is_clip_memory:
-                latent = latent[:, -1:, :, :, :].contiguous()
-            per_frame_latents.append(latent)
-        latents.append(torch.cat(per_frame_latents, dim=1))
-        del per_frame_latents
-    return torch.cat(latents, dim=0)
+def load_gguf_checkpoint(gguf_checkpoint_path):
 
-
-@torch.no_grad()
-def decode_benchmark_sample(video_vae, audio_vae, video_latent, audio_latent,enable_tiles,tile_size_in_frames,tile_size_in_pixels):
-    tiling_config=None
-    if enable_tiles:
-        tile_overlap_in_frames=24
-        tile_overlap_in_pixels=64
-        if tile_size_in_frames<=24:
-            tile_overlap_in_frames=tile_size_in_frames-8
-        if tile_size_in_pixels<=64:
-            tile_overlap_in_pixels=tile_size_in_pixels-32
-        tiling_config=TilingConfig(SpatialTilingConfig(tile_size_in_pixels=tile_size_in_pixels, tile_overlap_in_pixels=tile_overlap_in_pixels),TemporalTilingConfig(tile_size_in_frames=tile_size_in_frames, tile_overlap_in_frames=tile_overlap_in_frames))
-   
-    video_pixel = video_vae.decode_to_pixel(video_latent,tiling_config)
-   
-    audio_waveform = audio_vae.decode_to_waveform(audio_latent) if audio_latent is not None else None
-
-    video_uint8 = video_pixel[0]
-    if video_uint8.shape[0] == 3:
-        video_uint8 = video_uint8.permute(1, 0, 2, 3)
-    video_uint8 = video_uint8.permute(0, 2, 3, 1)
-    video_uint8 = (video_uint8.clamp(0, 1) * 255).cpu().to(torch.uint8).contiguous()
-
-    audio_float = normalize_audio_waveform_for_media(audio_waveform)
-    return video_uint8, audio_float
-
-
-def write_benchmark_media(
-    *,
-    output_path: Path,
-    video_uint8: torch.Tensor,
-    audio_waveform: Optional[torch.Tensor],
-    fps: int,
-    audio_sr: int,
-) -> dict[str, Any]:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    audio_waveform = normalize_audio_waveform_for_media(audio_waveform)
-    stats = audio_waveform_stats(audio_waveform)
-
-    wrote_with_audio = False
-    wrote_sidecar_wav = False
-    if audio_waveform is not None:
-        try:
-            write_video(
-                str(output_path),
-                video_uint8,
-                fps=fps,
-                audio_array=audio_waveform,
-                audio_fps=audio_sr,
-                audio_codec="aac",
-            )
-            wrote_with_audio = True
-        except Exception as exc:
-            print(f"[warn] write_video with audio failed for {output_path}: {exc}; audio_stats={stats}", flush=True)
-
-    if not wrote_with_audio:
-        write_video(str(output_path), video_uint8, fps=fps)
-        if audio_waveform is not None:
-            try:
-                import soundfile as sf
-                audio_np = audio_waveform.cpu().numpy()
-                if audio_np.ndim == 2:
-                    audio_np = audio_np.T  # [C, T] -> [T, C]
-                elif audio_np.ndim == 1:
-                    pass # 单声道直接保存
-                sf.write(str(output_path.with_suffix(".wav")), audio_np, int(audio_sr))
-            except Exception as exc:
-                print(f"[warn] sf.write failed for {output_path}: {exc}; audio_stats={stats}", flush=True)
-                try:
-                    torchaudio.save(str(output_path.with_suffix(".wav")), audio_waveform, audio_sr)
-                    wrote_sidecar_wav = True
-                except Exception as exc:
-                    print(f"[warn] torchaudio.save failed for {output_path}: {exc}; audio_stats={stats}", flush=True)
-
-    return {
-        "wrote_audio_in_mp4": wrote_with_audio,
-        "wrote_sidecar_wav": wrote_sidecar_wav,
-        "audio_stats": stats,
-    }
-
-
-def save_memory_bank_frames(memory_frames: list[Any], save_dir: Path) -> None:
-    save_dir.mkdir(parents=True, exist_ok=True)
-    for old_file in save_dir.glob("*.jpg"):
-        old_file.unlink()
-    for idx, frame in enumerate(memory_frames):
-        if isinstance(frame, list):
-            frame = frame[len(frame) // 2]
-        frame.convert("RGB").save(save_dir / f"memory_{idx:03d}.jpg")
-
-
-def concat_shot_videos(shot_paths: list[Path], output_path: Path) -> None:
-    if not shot_paths:
-        raise ValueError("No shot videos provided for concatenation")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as fp:
-        concat_file = Path(fp.name)
-        for shot_path in shot_paths:
-            fp.write(f"file '{shot_path.resolve().as_posix()}'\n")
-
-    try:
-        cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", str(concat_file), "-c", "copy", str(output_path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            fallback_cmd = [
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                "-i", str(concat_file),
-                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-                "-c:a", "aac", "-b:a", "192k",
-                str(output_path),
-            ]
-            fallback_result = subprocess.run(fallback_cmd, capture_output=True, text=True)
-            if fallback_result.returncode != 0:
-                raise RuntimeError(
-                    "Failed to concatenate shot videos with ffmpeg.\n"
-                    f"copy stderr:\n{result.stderr}\n"
-                    f"reencode stderr:\n{fallback_result.stderr}"
-                )
-    finally:
-        concat_file.unlink(missing_ok=True)
-
-
-def concat_shot_audios(audios: list[torch.Tensor]) -> Optional[torch.Tensor]:
-    if not audios:
-        return None
-    audio = audios[0]
-    if audio.ndim == 1:
-        sample_dim = 0
-    elif audio.ndim == 2:
-        sample_dim = 1 if audio.shape[0] <= audio.shape[1] else 0
+    from  diffusers.utils  import is_gguf_available, is_torch_available
+    if is_gguf_available() and is_torch_available():
+        import gguf
+        from gguf import GGUFReader
+        from diffusers.quantizers.gguf.utils import SUPPORTED_GGUF_QUANT_TYPES, GGUFParameter,dequantize_gguf_tensor
     else:
-        raise ValueError(f"Expected audio tensor with 1 or 2 dims, got shape={tuple(audio.shape)}")
-    return torch.cat([a.contiguous() for a in audios], dim=sample_dim).contiguous()
+        raise ImportError("Please install torch and gguf>=0.10.0 to load a GGUF checkpoint in PyTorch.")
+
+    reader = GGUFReader(gguf_checkpoint_path)
+    parsed_parameters = {}
+ 
+    for tensor in reader.tensors:
+        name = tensor.name
+        quant_type = tensor.tensor_type
+
+        # if the tensor is a torch supported dtype do not use GGUFParameter
+        is_gguf_quant = quant_type not in [gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16]
+        if is_gguf_quant and quant_type not in SUPPORTED_GGUF_QUANT_TYPES:
+            _supported_quants_str = "\n".join([str(type) for type in SUPPORTED_GGUF_QUANT_TYPES])
+            raise ValueError(
+                (
+                    f"{name} has a quantization type: {str(quant_type)} which is unsupported."
+                    "\n\nCurrently the following quantization types are supported: \n\n"
+                    f"{_supported_quants_str}"
+                    "\n\nTo request support for this quantization type please open an issue here: https://github.com/huggingface/diffusers"
+                )
+            )
+
+        weights = torch.from_numpy(tensor.data.copy())
+        parsed_parameters[name] = GGUFParameter(weights, quant_type=quant_type) if is_gguf_quant else weights
+        del tensor,weights
+    del reader
+    gc.collect()
+    return parsed_parameters
+
+def apply_loras_gguf(
+    model_sd,
+    lora_sd,
+):
+    sd = {}
+    for key, weight in model_sd.items():
+        if weight is None:
+            continue
+        device = weight.device
+        deltas_dtype =  torch.bfloat16
+        deltas = _prepare_deltas(lora_sd, key, deltas_dtype, device)
+        if deltas is None:
+            sd[key] = weight
+        else:
+            deltas = deltas.to(dtype=deltas_dtype)
+            if  getattr(weight,"quant_type",False):
+                try:
+                    weight = (dequantize_gguf_tensor(weight).to(dtype=deltas_dtype)) + deltas
+                    sd[key] = weight
+                except Exception as e:
+                    print(f"Error dequantizing GGUF weight for {key}: {e}")
+                    sd[key] = weight
+            else:
+                sd[key] = weight + deltas
+            
+        del weight,deltas
+    del model_sd
+    gc.collect()
+    return sd
+
+def _prepare_deltas( lora_sd,key: str, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor | None:
+    deltas = None
+    prefix = key[: -len(".weight")]
+    key_a = f"{prefix}.lora_down.weight"
+    key_b = f"{prefix}.lora_up.weight"
+    lora_alpha = f"{prefix}.alpha"
+    if key_a  in lora_sd :
+        lora_down = lora_sd[key_a].to(device=device)
+        lora_up = lora_sd[key_b].to(device=device)
+        alpha = float(lora_sd.get(lora_alpha, 1.0))
+        rank = lora_down.shape[0]
+        scaling_factor = alpha / rank
+        deltas = scaling_factor * torch.matmul(lora_up, lora_down).to(device)
+        del lora_down, lora_up,alpha
+    return deltas
+
+
